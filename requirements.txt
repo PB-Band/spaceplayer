@@ -2,3 +2,4 @@ numpy
 sounddevice
 miniaudio
 Pillow
+av
