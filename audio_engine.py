@@ -11,13 +11,24 @@ import numpy as np
 import sounddevice as sd
 import miniaudio
 
+try:
+    # Optional: PyAV (bundled FFmpeg) decodes formats miniaudio can't, e.g.
+    # .m4a (AAC/ALAC), and mislabelled files such as an AAC stream named .mp3.
+    import av
+except ImportError:
+    av = None
+
 SAMPLE_RATE = 44100
 CHANNELS = 2
 DEFAULT_CROSSFADE_SECONDS = 5.0
 MIN_CROSSFADE_SECONDS = 0.0
 MAX_CROSSFADE_SECONDS = 10.0
 BLOCK_FRAMES = 8192
-SUPPORTED_EXTENSIONS = {".mp3", ".wav"}
+# Formats miniaudio decodes natively.
+_MINIAUDIO_EXTENSIONS = {".mp3", ".wav", ".flac"}
+# Formats that need PyAV; only offered when it's installed.
+_AV_ONLY_EXTENSIONS = {".m4a"}
+SUPPORTED_EXTENSIONS = _MINIAUDIO_EXTENSIONS | (_AV_ONLY_EXTENSIONS if av else set())
 
 
 def _equal_power_curves(n):
@@ -29,16 +40,51 @@ def _equal_power_curves(n):
     return fade_out, fade_in
 
 
-def decode_track(path):
-    """Decode an audio file to a (frames, CHANNELS) float32 numpy array at SAMPLE_RATE."""
-    sound = miniaudio.decode_file(
-        str(path),
+def _decode_miniaudio(path):
+    # Read the bytes in Python and decode from memory rather than using
+    # miniaudio.decode_file: on Windows the latter can't open paths containing
+    # non-ASCII characters (accents, en dashes, emoji, CJK...) and fails with
+    # DecodeError -7 even though the audio itself is fine.
+    with open(path, "rb") as f:
+        data = f.read()
+    sound = miniaudio.decode(
+        data,
         output_format=miniaudio.SampleFormat.FLOAT32,
         nchannels=CHANNELS,
         sample_rate=SAMPLE_RATE,
     )
     arr = np.frombuffer(sound.samples, dtype=np.float32)
     return arr.reshape(-1, CHANNELS)
+
+
+def _decode_av(path):
+    resampler = av.AudioResampler(format="flt", layout="stereo", rate=SAMPLE_RATE)
+    chunks = []
+    with av.open(str(path)) as container:
+        stream = container.streams.audio[0]
+        for frame in container.decode(stream):
+            for out in resampler.resample(frame):
+                chunks.append(out.to_ndarray().reshape(-1, CHANNELS))
+        for out in resampler.resample(None):  # flush
+            chunks.append(out.to_ndarray().reshape(-1, CHANNELS))
+    if not chunks:
+        return np.zeros((0, CHANNELS), dtype=np.float32)
+    return np.ascontiguousarray(np.concatenate(chunks), dtype=np.float32)
+
+
+def decode_track(path):
+    """Decode an audio file to a (frames, CHANNELS) float32 numpy array at SAMPLE_RATE."""
+    path = Path(path)
+    if path.suffix.lower() in _MINIAUDIO_EXTENSIONS:
+        try:
+            return _decode_miniaudio(path)
+        except Exception:
+            if av is None:
+                raise
+            # Fall through: often a mislabelled file (e.g. AAC saved as .mp3).
+    if av is None:
+        raise RuntimeError(f"{path.suffix} files need PyAV (pip install av)")
+    return _decode_av(path)
 
 
 def find_audio_files(folder):
@@ -103,7 +149,8 @@ class ShuffleCrossfadePlayer:
     def set_folder(self, folder):
         files = find_audio_files(folder)
         if not files:
-            raise ValueError(f"No .mp3 or .wav files found in {folder}")
+            exts = ", ".join(sorted(SUPPORTED_EXTENSIONS))
+            raise ValueError(f"No audio files ({exts}) found in {folder}")
         self.files = files
 
     def start(self):
@@ -194,28 +241,33 @@ class ShuffleCrossfadePlayer:
             block = block * self.volume
         stream.write(np.ascontiguousarray(block, dtype=np.float32))
 
-    def _decode_with_fallback(self, path_iter, executor=None):
-        """Try decoding paths from path_iter until one succeeds; returns (path, audio, future_or_None)."""
+    def _decode_next(self, path_iter, announce=False):
+        """Pull paths from path_iter until one decodes; returns (path, audio).
+        Unreadable files are skipped (and reported via self.error) however many
+        come up in a row; gives up only after a full pass's worth of failures."""
+        last_exc = None
         for _ in range(len(self.files) + 1):
+            if self._stop_event.is_set():
+                raise RuntimeError("Stopped")
             path = next(path_iter)
+            if announce:
+                self.up_next = path.name
             try:
-                if executor is not None:
-                    future = executor.submit(decode_track, path)
-                    return path, future
-                audio = decode_track(path)
-                return path, audio
+                return path, decode_track(path)
             except Exception as exc:
+                last_exc = exc
                 self.error = f"Skipping unreadable file {path.name}: {exc}"
-                continue
-        raise RuntimeError("No decodable audio files found")
+        raise RuntimeError(f"No decodable audio files found (last error: {last_exc})")
 
     def _run(self):
         path_iter = self._infinite_shuffled_paths() if self.shuffle_enabled else self._infinite_sequential_paths()
         executor = ThreadPoolExecutor(max_workers=1)
         try:
             self.status = "Loading..."
-            current_path, current_audio = self._decode_with_fallback(path_iter)
-            next_path, next_future = self._decode_with_fallback(path_iter, executor)
+            current_path, current_audio = self._decode_next(path_iter)
+            # The iterator is only ever advanced by one decode job at a time
+            # (single worker, next job submitted after the previous resolves).
+            next_future = executor.submit(self._decode_next, path_iter, True)
             # How many leading frames of `current_audio` were already played as
             # part of the previous transition's crossfade blend (0 for the very
             # first track, which had no incoming crossfade).
@@ -228,7 +280,6 @@ class ShuffleCrossfadePlayer:
             try:
                 while not self._stop_event.is_set():
                     self.now_playing = current_path.name
-                    self.up_next = next_path.name
 
                     crossfade_frames = int(self.crossfade_seconds * SAMPLE_RATE)
 
@@ -265,12 +316,7 @@ class ShuffleCrossfadePlayer:
 
                     fade_out_src = current_audio[pos:pos + crossfade_frames]
 
-                    try:
-                        next_audio = next_future.result()
-                    except Exception as exc:
-                        self.error = f"Skipping unreadable file {next_path.name}: {exc}"
-                        next_path, next_future = self._decode_with_fallback(path_iter, executor)
-                        next_audio = next_future.result()
+                    next_path, next_audio = next_future.result()
 
                     final_len = min(fade_out_src.shape[0], next_audio.shape[0])
                     fade_out_curve, fade_in_curve = _equal_power_curves(final_len)
@@ -286,7 +332,7 @@ class ShuffleCrossfadePlayer:
                     carried_offset = final_len
                     current_audio = next_audio
                     current_path = next_path
-                    next_path, next_future = self._decode_with_fallback(path_iter, executor)
+                    next_future = executor.submit(self._decode_next, path_iter, True)
             finally:
                 stream.stop()
                 stream.close()
